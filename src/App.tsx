@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { AnimatePresence, motion } from 'motion/react';
 import {
   LineChart,
   Line,
@@ -24,10 +25,12 @@ import {
   TrendingUp,
   BarChart2,
   Calendar,
-  Dumbbell
+  Dumbbell,
+  Edit2,
+  Trash2
 } from 'lucide-react';
 import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously } from 'firebase/auth';
+import { getAuth, signInWithPopup, GoogleAuthProvider, onAuthStateChanged, signOut, type User } from 'firebase/auth';
 import {
   getFirestore,
   collection,
@@ -37,7 +40,9 @@ import {
   orderBy,
   Timestamp,
   doc,
-  setDoc
+  setDoc,
+  onSnapshot,
+  deleteDoc
 } from 'firebase/firestore';
 
 // --- Constants & Config ---
@@ -124,53 +129,117 @@ if (hasFirebaseConfig) {
 function useDataStore() {
   const [workouts, setWorkouts] = useState<WorkoutSession[]>([]);
   const [bodyStats, setBodyStats] = useState<BodyStat[]>([]);
-  const [userId, setUserId] = useState<string | null>('local-user');
+  const [userId, setUserId] = useState<string | null>(null);
+  const [user, setUser] = useState<User | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
 
   useEffect(() => {
     let isMounted = true;
+    let unsubWorkouts: (() => void) | null = null;
+    let unsubBody: (() => void) | null = null;
+    let unsubAuth: (() => void) | null = null;
 
-    const loadData = async () => {
-      if (hasFirebaseConfig && db && auth) {
-        try {
-          const userCred = await signInAnonymously(auth);
-          const uid = userCred.user.uid;
-          if (isMounted) setUserId(uid);
-
-          // Workouts
+    if (hasFirebaseConfig && db && auth) {
+      unsubAuth = onAuthStateChanged(auth, (currentUser) => {
+        if (!isMounted) return;
+        setAuthLoading(false);
+        if (currentUser) {
+          setUser(currentUser);
+          setUserId(currentUser.uid);
+          
+          const uid = currentUser.uid;
           const workoutsRef = collection(db, 'artifacts', APP_ID, 'users', uid, 'workouts');
           const wQuery = query(workoutsRef, orderBy('date', 'desc'));
-          const wSnap = await getDocs(wQuery);
-          const wData = wSnap.docs.map(d => ({ id: d.id, ...d.data() } as WorkoutSession));
-          if (isMounted) setWorkouts(wData);
+          unsubWorkouts = onSnapshot(wQuery, (snap) => {
+            const wData = snap.docs.map(d => ({ id: d.id, ...d.data() } as WorkoutSession));
+            if (isMounted) setWorkouts(wData);
+          }, (err) => {
+            console.error("Firebase Workouts Error:", err);
+          });
 
           // Body Stats
           const bodyRef = collection(db, 'artifacts', APP_ID, 'users', uid, 'body');
           const bQuery = query(bodyRef, orderBy('date', 'asc'));
-          const bSnap = await getDocs(bQuery);
-          const bData = bSnap.docs.map(d => ({ id: d.id, ...d.data() } as BodyStat));
-          if (isMounted) setBodyStats(bData);
-        } catch (error) {
-          console.error("Error loading from Firebase:", error);
+          unsubBody = onSnapshot(bQuery, (snap) => {
+            const bData = snap.docs.map(d => ({ id: d.id, ...d.data() } as BodyStat));
+            if (isMounted) setBodyStats(bData);
+          }, (err) => {
+            console.error("Firebase BodyStats Error:", err);
+          });
+        } else {
+          setUser(null);
+          setUserId(null);
+          setWorkouts([]);
+          setBodyStats([]);
+          if (unsubWorkouts) unsubWorkouts();
+          if (unsubBody) unsubBody();
         }
-      } else {
-        // LocalStorage Fallback
-        const locWorkouts = JSON.parse(localStorage.getItem(`${APP_ID}_workouts`) || '[]');
-        const locBody = JSON.parse(localStorage.getItem(`${APP_ID}_body`) || '[]');
-        if (isMounted) {
-          setWorkouts(locWorkouts.sort((a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime()));
-          setBodyStats(locBody.sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime()));
-        }
+      });
+    } else {
+      setAuthLoading(false);
+      setUserId('local-user');
+      // LocalStorage Fallback
+      const locWorkouts = JSON.parse(localStorage.getItem(`${APP_ID}_workouts`) || '[]');
+      const locBody = JSON.parse(localStorage.getItem(`${APP_ID}_body`) || '[]');
+      if (isMounted) {
+        setWorkouts(locWorkouts.sort((a: any, b: any) => new Date(b.date).getTime() - new Date(a.date).getTime()));
+        setBodyStats(locBody.sort((a: any, b: any) => new Date(a.date).getTime() - new Date(b.date).getTime()));
       }
+    }
+
+    return () => { 
+      isMounted = false;
+      if (unsubWorkouts) unsubWorkouts();
+      if (unsubBody) unsubBody();
+      if (unsubAuth) unsubAuth();
     };
-    loadData();
-    return () => { isMounted = false; };
   }, []);
 
-  const saveWorkout = async (data: Omit<WorkoutSession, 'id'>) => {
-    const newDoc = { ...data, id: Date.now().toString() };
+  const loginWithGoogle = async () => {
+    if (!auth) return;
+    try {
+      const provider = new GoogleAuthProvider();
+      provider.setCustomParameters({ prompt: 'select_account' });
+      await signInWithPopup(auth, provider);
+    } catch (err: any) {
+      console.error("Login failed", err);
+      if (err.code === 'auth/popup-blocked') {
+        alert("Pop-up blocked. Please enable pop-ups for this site to sign in.");
+      }
+    }
+  };
+
+  const logout = async () => {
+    if (!auth) return;
+    try {
+      await signOut(auth);
+    } catch (err) {
+      console.error("Logout failed", err);
+    }
+  };
+
+  const saveWorkout = async (data: Omit<WorkoutSession, 'id'>, id?: string) => {
+    const newDoc = { ...data, id: id || Date.now().toString() };
     if (hasFirebaseConfig && db && userId) {
-      const ref = doc(collection(db, 'artifacts', APP_ID, 'users', userId, 'workouts'));
-      await setDoc(ref, newDoc);
+      try {
+        const docId = id || doc(collection(db, 'artifacts', APP_ID, 'users', userId, 'workouts')).id;
+        const ref = doc(db, 'artifacts', APP_ID, 'users', userId, 'workouts', docId);
+        newDoc.id = docId;
+        await setDoc(ref, newDoc);
+      } catch (err) {
+        console.error("Firebase save failed, falling back to local storage:", err);
+        fallbackSaveWorkout(newDoc, id);
+      }
+    } else {
+      fallbackSaveWorkout(newDoc, id);
+    }
+  };
+
+  const fallbackSaveWorkout = (newDoc: WorkoutSession, id?: string) => {
+    if (id) {
+      const updated = workouts.map(w => w.id === id ? newDoc : w);
+      setWorkouts(updated);
+      localStorage.setItem(`${APP_ID}_workouts`, JSON.stringify(updated));
     } else {
       const updated = [newDoc, ...workouts];
       setWorkouts(updated);
@@ -181,66 +250,143 @@ function useDataStore() {
   const saveBodyStat = async (data: Omit<BodyStat, 'id'>) => {
     const newDoc = { ...data, id: Date.now().toString() };
     if (hasFirebaseConfig && db && userId) {
-      const ref = doc(collection(db, 'artifacts', APP_ID, 'users', userId, 'body'));
-      await setDoc(ref, newDoc);
+      try {
+        const ref = doc(collection(db, 'artifacts', APP_ID, 'users', userId, 'body'));
+        await setDoc(ref, newDoc);
+      } catch (err) {
+        console.error("Firebase save failed, falling back to local storage:", err);
+        fallbackSaveBody(newDoc);
+      }
     } else {
-      const updated = [...bodyStats, newDoc];
-      setBodyStats(updated);
-      localStorage.setItem(`${APP_ID}_body`, JSON.stringify(updated));
+      fallbackSaveBody(newDoc);
+    }
+  };
+  
+  const fallbackSaveBody = (newDoc: BodyStat) => {
+    const updated = [...bodyStats, newDoc];
+    setBodyStats(updated);
+    localStorage.setItem(`${APP_ID}_body`, JSON.stringify(updated));
+  };
+
+  const deleteWorkout = async (id: string) => {
+    if (hasFirebaseConfig && db && userId) {
+      try {
+        const ref = doc(db, 'artifacts', APP_ID, 'users', userId, 'workouts', id);
+        await deleteDoc(ref);
+      } catch (err) {
+        console.error("Firebase delete failed, falling back to local storage:", err);
+        fallbackDeleteWorkout(id);
+      }
+    } else {
+      fallbackDeleteWorkout(id);
     }
   };
 
-  return { workouts, bodyStats, saveWorkout, saveBodyStat };
+  const fallbackDeleteWorkout = (id: string) => {
+    const updated = workouts.filter(w => w.id !== id);
+    setWorkouts(updated);
+    localStorage.setItem(`${APP_ID}_workouts`, JSON.stringify(updated));
+  };
+
+  return { workouts, bodyStats, saveWorkout, saveBodyStat, deleteWorkout, user, authLoading, loginWithGoogle, logout };
 }
 
 
 // --- Main App ---
 export default function App() {
   const [activeTab, setActiveTab] = useState<'workout' | 'history' | 'body' | 'reference' | 'timer'>('workout');
-  const { workouts, bodyStats, saveWorkout, saveBodyStat } = useDataStore();
+  const { workouts, bodyStats, saveWorkout, saveBodyStat, deleteWorkout, user, authLoading, loginWithGoogle, logout } = useDataStore();
+  const [editingWorkout, setEditingWorkout] = useState<WorkoutSession | null>(null);
+
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const showToast = (msg: string) => {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 3000);
+  };
 
   const [timeLeft, setTimeLeft] = useState(0);
   const [initialTime, setInitialTime] = useState(0);
   const [isTimerRunning, setIsTimerRunning] = useState(false);
+  const endTimeRef = useRef<number | null>(null);
 
   const startTimer = async (seconds: number) => {
-    if ('Notification' in window && Notification.permission === 'default') {
-      await Notification.requestPermission();
-    }
+    // 【Bug 修復區】 PWA 環境下要求權限需加上防護
+    try {
+      if ('Notification' in window && Notification.permission === 'default') {
+        await Notification.requestPermission();
+      }
+    } catch (e) { console.warn("Notification error", e); }
+    
     setInitialTime(seconds);
     setTimeLeft(seconds);
+    endTimeRef.current = Date.now() + seconds * 1000;
     setIsTimerRunning(true);
   };
 
   const stopTimer = () => {
     setTimeLeft(0);
+    endTimeRef.current = null;
     setIsTimerRunning(false);
     setActiveTab('workout');
   };
 
   useEffect(() => {
     let interval: any;
-    if (isTimerRunning && timeLeft > 0) {
-      interval = setInterval(() => {
-        setTimeLeft(prev => prev - 1);
-      }, 1000);
-    } else if (isTimerRunning && timeLeft === 0) {
-      setIsTimerRunning(false);
-      if ('vibrate' in navigator) navigator.vibrate([200, 100, 200, 100, 500]);
-      if ('Notification' in window && Notification.permission === 'granted') {
-        new Notification('TITANSYNC', { body: '休息時間結束，準備下一組！' });
+    
+    // 【Bug 修復區】 絕對時間戳計時法
+    const checkTimer = () => {
+      if (!isTimerRunning || !endTimeRef.current) return;
+      const now = Date.now();
+      const remaining = Math.max(0, Math.ceil((endTimeRef.current - now) / 1000));
+      
+      setTimeLeft(remaining);
+      
+      if (remaining === 0) {
+        setIsTimerRunning(false);
+        endTimeRef.current = null;
+        
+        // 【Bug 修復區】 防止 iOS/Web PWA 環境調用 API 導致渲染崩潰
+        try {
+          if ('vibrate' in navigator) navigator.vibrate([200, 100, 200, 100, 500]);
+        } catch(e) { console.warn('Vibrate error', e); }
+        
+        try {
+          if ('Notification' in window && Notification.permission === 'granted') {
+            new Notification('TITANSYNC', { body: '休息時間結束，準備下一組！' });
+          }
+        } catch(e) { console.warn('Notification error', e); }
+
+        setActiveTab('workout');
       }
-      setActiveTab('workout');
+    };
+
+    if (isTimerRunning) {
+      interval = setInterval(checkTimer, 1000);
+      
+      // 【Bug 修復區】 Visibility API 監聽 (背景切回)
+      const handleVisibilityChange = () => {
+        if (document.visibilityState === 'visible') {
+          checkTimer();
+        }
+      };
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+      
+      return () => {
+        clearInterval(interval);
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+      };
     }
-    return () => clearInterval(interval);
-  }, [isTimerRunning, timeLeft, setActiveTab]);
+  }, [isTimerRunning, setActiveTab]);
 
   const getSuggestedWeight = (exerciseName: string) => {
     for (let i = 0; i < workouts.length; i++) {
         const ex = workouts[i].exercises.find(e => e.name === exerciseName);
         if (ex) {
-            const allTargetsMet = ex.sets.every(s => s.reps >= getTargetReps(exerciseName));
-            const maxLastWeight = Math.max(...ex.sets.map(s => s.weight));
+            const completedSets = ex.sets.filter(s => s.completed);
+            if (completedSets.length === 0) continue;
+            const allTargetsMet = completedSets.every(s => s.reps >= getTargetReps(exerciseName));
+            const maxLastWeight = Math.max(...completedSets.map(s => s.weight));
             if (allTargetsMet) {
                 return maxLastWeight + getIncrement(exerciseName);
             }
@@ -250,11 +396,50 @@ export default function App() {
     return 20;
   };
 
+  const handleEditWorkout = (workout: WorkoutSession) => {
+    setEditingWorkout(workout);
+    setActiveTab('workout');
+  };
+
+  const handleDeleteWorkout = async (id: string) => {
+    try {
+      await deleteWorkout(id);
+      showToast('紀錄已刪除！');
+    } catch (err) {
+      console.error(err);
+      showToast('刪除失敗');
+    }
+  };
+
   const renderTabContent = () => {
+    if (authLoading) {
+      return <div className="flex items-center justify-center p-12 text-lime-400 font-black animate-pulse">LOADING...</div>;
+    }
+    if (hasFirebaseConfig && !user) {
+      return (
+        <div className="flex flex-col items-center justify-center min-h-[50vh] space-y-6">
+          <div className="w-24 h-24 bg-lime-400/10 flex items-center justify-center rounded-full mb-4">
+            <Dumbbell size={48} className="text-lime-400" />
+          </div>
+          <h2 className="text-2xl font-black italic uppercase text-center">Login to Sync</h2>
+          <p className="text-xs text-neutral-500 uppercase tracking-widest text-center max-w-xs">
+            Start tracking your progress and sync it securely via Firebase.
+          </p>
+          <motion.button 
+            whileTap={{ scale: 0.95 }} 
+            onClick={loginWithGoogle} 
+            className="px-8 py-4 bg-lime-400 text-black font-black rounded-full uppercase tracking-widest text-sm shadow-[0_0_20px_rgba(163,230,53,0.3)]"
+          >
+            Sign in with Google
+          </motion.button>
+        </div>
+      );
+    }
+
     switch (activeTab) {
-      case 'workout': return <WorkoutTab workouts={workouts} onSave={saveWorkout} getSuggestedWeight={getSuggestedWeight} setActiveTab={setActiveTab} />;
-      case 'history': return <HistoryTab workouts={workouts} />;
-      case 'body': return <BodyTab bodyStats={bodyStats} onSave={saveBodyStat} />;
+      case 'workout': return <WorkoutTab workouts={workouts} onSave={saveWorkout} getSuggestedWeight={getSuggestedWeight} setActiveTab={setActiveTab} showToast={showToast} editingWorkout={editingWorkout} setEditingWorkout={setEditingWorkout} />;
+      case 'history': return <HistoryTab workouts={workouts} onDelete={handleDeleteWorkout} onEdit={handleEditWorkout} />;
+      case 'body': return <BodyTab bodyStats={bodyStats} onSave={saveBodyStat} showToast={showToast} />;
       case 'reference': return <ReferenceTab />;
       case 'timer': return <TimerTab timeLeft={timeLeft} initialTime={initialTime} isTimerRunning={isTimerRunning} startTimer={startTimer} stopTimer={stopTimer} />;
     }
@@ -262,6 +447,21 @@ export default function App() {
 
   return (
     <div className={`min-h-screen ${THEME.bg} ${THEME.text} font-sans pb-24 relative`}>
+      {/* === 【動畫邏輯區】 全局 Toast 通知框 === */}
+      <AnimatePresence>
+        {toastMessage && (
+          <motion.div
+            initial={{ opacity: 0, y: -50 }}
+            animate={{ opacity: 1, y: 0 }}
+            exit={{ opacity: 0, y: -50 }}
+            transition={{ duration: 0.3, ease: 'easeOut' }}
+            className="fixed top-10 left-1/2 -translate-x-1/2 z-[100] bg-lime-400 text-black px-6 py-3 rounded-full font-black text-sm shadow-[0_10px_40px_rgba(163,230,53,0.3)] whitespace-nowrap"
+          >
+            {toastMessage}
+          </motion.div>
+        )}
+      </AnimatePresence>
+
       {/* Background with glow gradients and illustrations */}
       <div className="fixed inset-0 pointer-events-none z-0 overflow-hidden">
         <div className="absolute top-[-10%] left-[-10%] w-[500px] h-[500px] bg-lime-400/20 blur-[120px] rounded-full mix-blend-screen" />
@@ -284,18 +484,34 @@ export default function App() {
             <h1 className="text-2xl font-black tracking-tighter italic shadow-sm drop-shadow-md">RecompX</h1>
             <p className="text-[10px] uppercase tracking-widest text-[#a3a3a3] font-bold">Progress & Adapt</p>
           </div>
-          <div className="text-right">
+          <div className="text-right flex flex-col items-end gap-1">
             {!hasFirebaseConfig ? (
               <span className="text-[10px] uppercase font-bold tracking-widest px-2 py-1 bg-yellow-500/20 text-yellow-500 rounded border border-yellow-500/20">Local Mode</span>
+            ) : user ? (
+              <>
+                <p className="text-[10px] uppercase tracking-widest text-lime-400 font-bold">{user.displayName || user.email}</p>
+                <button onClick={logout} className="text-[10px] uppercase text-neutral-500 font-bold tracking-widest hover:text-white transition">Sign Out</button>
+              </>
             ) : (
-              <p className="text-[10px] uppercase tracking-widest text-lime-400 font-bold">Goal: Body Recomp</p>
+              <p className="text-[10px] uppercase tracking-widest text-neutral-500 font-bold">Not Logged In</p>
             )}
           </div>
         </div>
       </header>
 
-      <main className="max-w-xl mx-auto p-4 z-10 relative">
-        {renderTabContent()}
+      <main className="max-w-xl mx-auto p-4 z-10 relative overflow-hidden">
+        {/* === 【動畫邏輯區】 AnimatePresence 頁面過場 === */}
+        <AnimatePresence mode="wait">
+          <motion.div
+            key={activeTab}
+            initial={{ opacity: 0, y: 15, scale: 0.98 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: -10, scale: 0.98 }}
+            transition={{ duration: 0.25, ease: "easeOut" }}
+          >
+            {renderTabContent()}
+          </motion.div>
+        </AnimatePresence>
       </main>
 
       <nav className={`fixed bottom-0 w-full bg-[#0A0A0A]/80 backdrop-blur-xl border-t ${THEME.border} pb-safe h-20 z-50`}>
@@ -307,10 +523,12 @@ export default function App() {
             { id: 'body', icon: CustomBodyIcon, label: '體態' },
             { id: 'reference', icon: BookOpen, label: '圖解' }
           ].map(tab => (
-            <button
+            <motion.button
               key={tab.id}
+              whileTap={{ scale: 0.9 }}
+              custom={tab.id}
               onClick={() => setActiveTab(tab.id as any)}
-              className={`flex flex-col items-center justify-center transition-colors group ${
+              className={`flex flex-col items-center justify-center transition-colors group relative ${
                 activeTab === tab.id ? 'text-lime-400' : 'text-neutral-500 hover:text-white'
               }`}
             >
@@ -324,7 +542,7 @@ export default function App() {
                 )}
               </div>
               <span className="text-[9px] font-black uppercase tracking-widest mt-1 opacity-90">{tab.label}</span>
-            </button>
+            </motion.button>
           ))}
         </div>
       </nav>
@@ -348,7 +566,7 @@ function TimerTab({ timeLeft, initialTime, isTimerRunning, startTimer, stopTimer
   const secs = timeLeft % 60;
 
   return (
-    <div className="flex flex-col items-center justify-center min-h-[calc(100dvh-12rem)] animate-in fade-in py-4 w-full">
+    <div className="flex flex-col items-center justify-center min-h-[calc(100dvh-12rem)] py-4 w-full">
       <div className="relative w-64 h-64 flex items-center justify-center shrink-0 mb-8">
         <svg viewBox="0 0 200 200" className="absolute inset-0 w-full h-full -rotate-90 transform">
           <circle
@@ -383,22 +601,22 @@ function TimerTab({ timeLeft, initialTime, isTimerRunning, startTimer, stopTimer
       {!isTimerRunning ? (
         <div className="w-full space-y-4 max-w-xs">
           <div className="grid grid-cols-3 gap-3">
-             <button onClick={() => startTimer(60)} className={`py-4 rounded-3xl ${THEME.card} border ${THEME.border} font-black text-white hover:border-lime-400/50 transition`}>60s</button>
-             <button onClick={() => startTimer(90)} className={`py-4 rounded-3xl ${THEME.card} border ${THEME.border} font-black text-white hover:border-lime-400/50 transition`}>90s</button>
-             <button onClick={() => startTimer(120)} className={`py-4 rounded-3xl ${THEME.card} border ${THEME.border} font-black text-white hover:border-lime-400/50 transition`}>120s</button>
+             <motion.button whileTap={{ scale: 0.95 }} onClick={() => startTimer(60)} className={`py-4 rounded-3xl ${THEME.card} border ${THEME.border} font-black text-white hover:border-lime-400/50 transition`}>60s</motion.button>
+             <motion.button whileTap={{ scale: 0.95 }} onClick={() => startTimer(90)} className={`py-4 rounded-3xl ${THEME.card} border ${THEME.border} font-black text-white hover:border-lime-400/50 transition`}>90s</motion.button>
+             <motion.button whileTap={{ scale: 0.95 }} onClick={() => startTimer(120)} className={`py-4 rounded-3xl ${THEME.card} border ${THEME.border} font-black text-white hover:border-lime-400/50 transition`}>120s</motion.button>
           </div>
           <div className="flex gap-3">
              <input type="number" placeholder="SEC" value={customTime} onChange={e => setCustomTime(e.target.value)} className={`flex-1 min-w-0 ${THEME.card} border ${THEME.border} p-4 rounded-3xl text-white text-center font-black focus:border-lime-400 outline-none transition`} />
-             <button onClick={() => {
+             <motion.button whileTap={{ scale: 0.95 }} onClick={() => {
                 const val = parseInt(customTime);
                 if (val > 0) startTimer(val);
-             }} className={`shrink-0 px-8 rounded-3xl bg-lime-400 text-black font-black uppercase tracking-widest hover:bg-lime-300 transition shadow-[0_0_20px_rgba(163,230,53,0.2)]`}>START</button>
+             }} className={`shrink-0 px-8 rounded-3xl bg-lime-400 text-black font-black uppercase tracking-widest hover:bg-lime-300 transition shadow-[0_0_20px_rgba(163,230,53,0.2)]`}>START</motion.button>
           </div>
         </div>
       ) : (
-        <button onClick={stopTimer} className={`w-full max-w-xs py-5 rounded-3xl bg-white/10 text-white font-black uppercase tracking-widest backdrop-blur-md border border-white/20 hover:bg-white/20 transition`}>
+        <motion.button whileTap={{ scale: 0.98 }} onClick={stopTimer} className={`w-full max-w-xs py-5 rounded-3xl bg-white/10 text-white font-black uppercase tracking-widest backdrop-blur-md border border-white/20 hover:bg-white/20 transition`}>
           馬上結束
-        </button>
+        </motion.button>
       )}
     </div>
   );
@@ -406,24 +624,28 @@ function TimerTab({ timeLeft, initialTime, isTimerRunning, startTimer, stopTimer
 
 
 // --- Workout Tab ---
-function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any) {
+function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab, showToast, editingWorkout, setEditingWorkout }: any) {
   const [activePlan, setActivePlan] = useState<'A' | 'B' | string | null>(null);
   const [sessionData, setSessionData] = useState<ExerciseRecord[]>([]);
   const [showConfirm, setShowConfirm] = useState(false);
 
   useEffect(() => {
-    if (!activePlan && workouts.length > 0 && defaultWorkoutPlans.length > 0) {
+    if (editingWorkout) {
+      setActivePlan(editingWorkout.plan);
+      setSessionData(editingWorkout.exercises);
+    } else if (!activePlan && workouts.length > 0 && defaultWorkoutPlans.length > 0 && sessionData.length === 0) {
       const lastPlanId = workouts[0].plan;
       const lastIndex = defaultWorkoutPlans.findIndex(p => p.id === lastPlanId);
       const nextIndex = (lastIndex + 1) % defaultWorkoutPlans.length;
       setActivePlan(defaultWorkoutPlans[nextIndex].id);
-    } else if (!activePlan && defaultWorkoutPlans.length > 0) {
+    } else if (!activePlan && defaultWorkoutPlans.length > 0 && sessionData.length === 0) {
       setActivePlan(defaultWorkoutPlans[0].id);
     }
-  }, [workouts, activePlan]);
+  }, [workouts, activePlan, editingWorkout, sessionData.length]);
 
   const startWorkout = (planId: string) => {
     setActivePlan(planId);
+    setEditingWorkout(null);
     const plan = defaultWorkoutPlans.find(p => p.id === planId);
     if (!plan) return;
 
@@ -454,17 +676,41 @@ function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any)
     setSessionData(newData);
   };
 
-  const finishWorkout = () => {
-    const today = new Date().toISOString().split('T')[0];
-    onSave({ date: today, plan: activePlan, exercises: sessionData });
-    setActivePlan(null);
-    setSessionData([]);
-    setShowConfirm(false);
+  const finishWorkout = async () => {
+    const today = editingWorkout ? editingWorkout.date : new Date().toISOString().split('T')[0];
+    
+    try {
+      await onSave({ date: today, plan: activePlan as 'A' | 'B', exercises: sessionData }, editingWorkout?.id);
+      showToast('紀錄儲存成功！');
+      
+      setActivePlan(null);
+      setSessionData([]);
+      setShowConfirm(false);
+      setEditingWorkout(null);
+      setActiveTab('history');
+    } catch (err) {
+      console.error(err);
+      showToast('儲存失敗');
+    }
   };
 
-  if (sessionData.length === 0) {
-    return (
-      <div className="space-y-6 animate-in fade-in slide-in-from-bottom-4 duration-500 mt-4">
+  const abandonWorkout = () => {
+    setSessionData([]);
+    setActivePlan(null);
+    setEditingWorkout(null);
+  };
+
+  return (
+    <AnimatePresence mode="wait">
+      {sessionData.length === 0 ? (
+        <motion.div 
+          key="plans"
+          initial={{ x: -20, opacity: 0 }}
+          animate={{ x: 0, opacity: 1 }}
+          exit={{ x: -20, opacity: 0 }}
+          transition={{ duration: 0.3, ease: 'easeOut' }}
+          className="space-y-6 mt-4"
+        >
         <div className={`p-6 rounded-3xl ${THEME.card} border ${THEME.border} shadow-xl relative overflow-hidden`}>
           <div className="absolute top-0 right-0 w-32 h-32 bg-lime-400/10 blur-3xl rounded-full" />
           <h2 className="text-2xl font-black tracking-tighter mb-2 italic uppercase">準備好今天的訓練了嗎？</h2>
@@ -472,8 +718,9 @@ function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any)
           
           <div className="flex flex-col gap-4">
             {defaultWorkoutPlans.map(p => (
-              <button
+              <motion.button
                 key={p.id}
+                whileTap={{ scale: 0.98 }}
                 onClick={() => startWorkout(p.id)}
                 className={`p-4 rounded-3xl border text-left transition ${
                   activePlan === p.id 
@@ -495,7 +742,7 @@ function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any)
                      <li key={ex.name} className="truncate">• {ex.name.split(' (')[0]}</li>
                   ))}
                 </ul>
-              </button>
+              </motion.button>
             ))}
           </div>
         </div>
@@ -512,22 +759,26 @@ function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any)
             </div>
           </div>
         </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="space-y-6 pb-20 animate-in fade-in duration-300 mt-4">
-      <div className="flex justify-between items-end mb-4">
+        </motion.div>
+      ) : (
+        <motion.div 
+          key="session"
+          initial={{ x: 20, opacity: 0 }}
+          animate={{ x: 0, opacity: 1 }}
+          exit={{ x: 20, opacity: 0 }}
+          transition={{ duration: 0.3, ease: 'easeOut' }}
+          className="space-y-6 pb-20 mt-4"
+        >
+        <div className="flex justify-between items-end mb-4">
         <div>
           <span className="text-[10px] font-black tracking-widest text-lime-400 uppercase">Current Session</span>
           <h2 className="text-4xl font-black tracking-tighter uppercase italic">課表 {activePlan}</h2>
         </div>
         <div className="flex flex-col items-end gap-2">
-          <button onClick={() => setSessionData([])} className="text-[10px] uppercase font-bold tracking-widest text-neutral-500 hover:text-white transition">放棄</button>
-          <button onClick={() => setActiveTab('timer')} className="flex items-center gap-1 text-[10px] font-black tracking-widest text-lime-400 bg-lime-400/10 px-3 py-1.5 rounded-full border border-lime-400/20 shadow-[0_0_10px_rgba(163,230,53,0.1)]">
+          <button onClick={abandonWorkout} className="text-[10px] uppercase font-bold tracking-widest text-neutral-500 hover:text-white transition">放棄</button>
+          <motion.button whileTap={{ scale: 0.95 }} onClick={() => setActiveTab('timer')} className="flex items-center gap-1 text-[10px] font-black tracking-widest text-lime-400 bg-lime-400/10 px-3 py-1.5 rounded-full border border-lime-400/20 shadow-[0_0_10px_rgba(163,230,53,0.1)]">
              <Timer size={12} strokeWidth={3} /> 去休息
-          </button>
+          </motion.button>
         </div>
       </div>
 
@@ -542,42 +793,59 @@ function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any)
             </div>
             
             <div className="mt-4 space-y-2">
-              {ex.sets.map((set, setIndex) => (
-                <div key={setIndex} className={`flex items-center gap-2 p-2 rounded-2xl transition-colors ${set.completed ? 'bg-lime-400/10 border border-lime-400/30' : 'bg-black/30 border border-white/5'}`}>
+              {ex.sets.map((set, setIndex) => {
+                const targetReps = getTargetReps(ex.name);
+                const isMet = set.reps >= targetReps && set.reps !== 0;
+                return (
+                <motion.div 
+                  key={setIndex}
+                  animate={{
+                     scale: isMet ? [1, 1.02, 1] : 1
+                  }}
+                  transition={{ duration: 0.2 }}
+                  className={`flex items-center gap-2 p-2 rounded-2xl transition-colors ${set.completed ? 'bg-lime-400/10 border border-lime-400/30' : 'bg-black/30 border border-white/5 backdrop-blur-md'}`}
+                >
                   <div className="w-8 text-center text-[10px] font-black text-neutral-500 uppercase">S{setIndex + 1}</div>
                   <input 
                     type="number" 
                     value={set.weight}
                     onChange={e => updateSet(exIndex, setIndex, 'weight', Number(e.target.value))}
-                    className="w-16 bg-transparent font-black tracking-tighter text-lg text-center focus:text-lime-400 outline-none"
+                    className="w-16 bg-transparent font-black tracking-tighter text-lg text-center focus:text-white outline-none transition-colors"
+                    style={{ color: isMet ? '#10b981' : '' }}
                   />
                   <span className="text-[10px] uppercase font-bold text-neutral-500">kg</span>
                   <input 
                     type="number" 
                     value={set.reps}
                     onChange={e => updateSet(exIndex, setIndex, 'reps', Number(e.target.value))}
-                    className="w-14 bg-transparent font-black tracking-tighter text-lg text-center focus:text-lime-400 outline-none ml-2"
+                    className="w-14 bg-transparent font-black tracking-tighter text-lg text-center focus:text-white outline-none ml-2 transition-colors"
+                    style={{ color: isMet ? '#10b981' : '' }}
                   />
                   <span className="text-[10px] uppercase font-bold text-neutral-500">reps</span>
                   
                   <div className="flex-1" />
                   
-                  <button 
+                  <motion.button 
+                    whileTap={{ scale: 0.9 }}
                     onClick={() => updateSet(exIndex, setIndex, 'completed', !set.completed)}
-                    className={`w-10 h-10 flex items-center justify-center rounded-xl transition ${
-                      set.completed ? 'bg-lime-400 text-black shadow-[0_0_15px_rgba(163,230,53,0.3)]' : 'bg-white/5 border border-white/10 text-neutral-400 hover:text-white'
+                    className={`shrink-0 w-10 h-10 flex items-center justify-center rounded-xl transition ${
+                      set.completed 
+                        ? 'bg-lime-400 text-black shadow-[0_0_15px_rgba(163,230,53,0.3)]' 
+                        : isMet 
+                          ? 'bg-emerald-500 text-black shadow-[0_0_15px_rgba(16,185,129,0.3)]' 
+                          : 'bg-white/5 border border-white/10 text-neutral-400 hover:text-white'
                     }`}
                   >
-                    <RefreshCw size={14} className={set.completed ? 'opacity-0' : 'opacity-100'} style={{position: 'absolute'}} strokeWidth={3} />
-                    {set.completed && <div className="font-black">✓</div>}
-                  </button>
-                </div>
-              ))}
+                    <RefreshCw size={14} className={(set.completed || isMet) ? 'opacity-0' : 'opacity-100'} style={{position: 'absolute'}} strokeWidth={3} />
+                    {(set.completed || isMet) && <div className="font-black">✓</div>}
+                  </motion.button>
+                </motion.div>
+              )})}
             </div>
             <div className="mt-3">
-              <button onClick={() => addSet(exIndex)} className="w-full py-2 text-[10px] uppercase font-black tracking-widest text-neutral-500 hover:text-white hover:bg-white/5 rounded-xl border border-transparent hover:border-white/10 transition flex items-center justify-center gap-1">
+              <motion.button whileTap={{ scale: 0.98 }} onClick={() => addSet(exIndex)} className="w-full py-2 text-[10px] uppercase font-black tracking-widest text-neutral-500 hover:text-white hover:bg-white/5 rounded-xl border border-transparent hover:border-white/10 transition flex items-center justify-center gap-1">
                 <Plus size={14} strokeWidth={3} /> 新增一組
-              </button>
+              </motion.button>
             </div>
           </div>
         ))}
@@ -585,27 +853,31 @@ function WorkoutTab({ workouts, onSave, getSuggestedWeight, setActiveTab }: any)
 
       <div className="pt-4 pb-8">
         {!showConfirm ? (
-           <button 
+           <motion.button 
+             whileTap={{ scale: 0.98 }}
              onClick={() => setShowConfirm(true)}
              className="w-full bg-lime-400 text-black font-black uppercase tracking-widest py-4 rounded-2xl hover:bg-lime-300 transition text-sm shadow-[0_0_20px_rgba(163,230,53,0.2)]"
            >
              完成訓練
-           </button>
+           </motion.button>
         ) : (
            <div className="flex gap-3 animate-in slide-in-from-bottom-2">
-             <button onClick={() => setShowConfirm(false)} className={`flex-1 py-4 ${THEME.card} border ${THEME.border} rounded-2xl font-bold uppercase tracking-widest text-xs text-white`}>取消</button>
-             <button onClick={finishWorkout} className="flex-1 py-4 bg-lime-400 text-black font-black rounded-2xl uppercase tracking-widest text-xs shadow-[0_0_20px_rgba(163,230,53,0.2)]">確認儲存</button>
+             <motion.button whileTap={{ scale: 0.95 }} onClick={() => setShowConfirm(false)} className={`flex-1 py-4 ${THEME.card} border ${THEME.border} rounded-2xl font-bold uppercase tracking-widest text-xs text-white`}>取消</motion.button>
+             <motion.button whileTap={{ scale: 0.95 }} onClick={finishWorkout} className="flex-1 py-4 bg-lime-400 text-black font-black rounded-2xl uppercase tracking-widest text-xs shadow-[0_0_20px_rgba(163,230,53,0.2)]">確認儲存</motion.button>
            </div>
         )}
       </div>
-    </div>
+      </motion.div>
+      )}
+    </AnimatePresence>
   );
 }
 
 // --- History Tab ---
-function HistoryTab({ workouts }: { workouts: WorkoutSession[] }) {
+function HistoryTab({ workouts, onDelete, onEdit }: { workouts: WorkoutSession[], onDelete?: (id:string)=>void, onEdit?: (w:WorkoutSession)=>void }) {
   const [view, setView] = useState<'list'|'chart'>('list');
   const [chartEx, setChartEx] = useState(defaultWorkoutPlans[0]?.exercises[0]?.name || '');
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const chartData = useMemo(() => {
     if (!chartEx) return [];
@@ -613,9 +885,11 @@ function HistoryTab({ workouts }: { workouts: WorkoutSession[] }) {
       .filter(w => w.exercises.some(e => e.name === chartEx))
       .map(w => {
          const ex = w.exercises.find(e => e.name === chartEx);
-         const maxWeight = Math.max(...(ex?.sets.map(succ => succ.weight) || [0]));
-         return { date: w.date.substring(5), weight: maxWeight, fullDate: w.date };
+         const completedSets = ex?.sets.filter(s => s.completed) || [];
+         const maxWeight = completedSets.length > 0 ? Math.max(...completedSets.map(s => s.weight)) : 0;
+         return { date: w.date.substring(5), weight: maxWeight, fullDate: w.date, numCompleted: completedSets.length };
       })
+      .filter(d => d.numCompleted > 0)
       .sort((a,b) => new Date(a.fullDate).getTime() - new Date(b.fullDate).getTime());
   }, [workouts, chartEx]);
 
@@ -628,7 +902,7 @@ function HistoryTab({ workouts }: { workouts: WorkoutSession[] }) {
   );
 
   return (
-    <div className="space-y-6 animate-in fade-in mt-4">
+    <div className="space-y-6 mt-4">
       <div className="flex justify-between items-center mb-6">
         <div>
           <h2 className="text-4xl font-black tracking-tighter uppercase italic">訓練軌跡</h2>
@@ -682,7 +956,7 @@ function HistoryTab({ workouts }: { workouts: WorkoutSession[] }) {
       )}
 
       {view === 'list' && <div className="flex flex-col gap-3">{workouts.map((w, i) => (
-        <div key={i} className={`p-4 rounded-3xl ${THEME.card} border ${THEME.border} relative`}>
+        <div key={w.id || i} className={`p-4 rounded-3xl ${THEME.card} border ${THEME.border} relative`}>
           <div className="flex justify-between items-center mb-3 border-b border-white/5 pb-3">
             <div className="flex items-center gap-3">
               <div className="flex flex-col items-center justify-center w-12 h-12 rounded-xl bg-black/30 border border-white/5">
@@ -691,15 +965,31 @@ function HistoryTab({ workouts }: { workouts: WorkoutSession[] }) {
               </div>
               <div>
                 <div className="font-bold text-lg">{new Date(w.date).toLocaleDateString('zh-TW', { month:'short', day:'numeric'})}</div>
-                <div className="text-[10px] uppercase font-bold tracking-widest text-neutral-500 flex items-center gap-1 mt-0.5"><Calendar size={12} strokeWidth={2.5}/> {w.exercises.length} Items</div>
+                <div className="text-[10px] uppercase font-bold tracking-widest text-neutral-500 flex items-center gap-1 mt-0.5"><Calendar size={12} strokeWidth={2.5}/> {w.exercises.filter(ex => ex.sets.some(s => s.completed)).length} Items</div>
               </div>
+            </div>
+            <div className="flex gap-2">
+              <motion.button whileTap={{ scale: 0.9 }} onClick={() => onEdit?.(w)} className="p-2 bg-white/5 border border-white/10 text-neutral-400 hover:text-white rounded-xl transition">
+                <Edit2 size={16} strokeWidth={2.5} />
+              </motion.button>
+              <motion.button whileTap={{ scale: 0.9 }} onClick={() => {
+                if (confirmDeleteId === w.id) {
+                  onDelete?.(w.id);
+                  setConfirmDeleteId(null);
+                } else {
+                  setConfirmDeleteId(w.id);
+                }
+              }} className={`p-2 rounded-xl transition ${confirmDeleteId === w.id ? 'bg-red-500 text-black shadow-[0_0_15px_rgba(239,68,68,0.3)]' : 'bg-red-500/10 border border-red-500/20 text-red-400 hover:text-red-300'}`}>
+                {confirmDeleteId === w.id ? <span className="text-[10px] uppercase font-black tracking-widest px-1">刪除此紀錄</span> : <Trash2 size={16} strokeWidth={2.5} />}
+              </motion.button>
             </div>
           </div>
           
           <div className="space-y-2">
-            {w.exercises.map((ex, j) => {
-              const maxW = Math.max(...ex.sets.map(s => s.weight));
-              const totalSets = ex.sets.length;
+            {w.exercises.filter(ex => ex.sets.some(s => s.completed)).map((ex, j) => {
+              const completedSets = ex.sets.filter(s => s.completed);
+              const maxW = completedSets.length > 0 ? Math.max(...completedSets.map(s => s.weight)) : 0;
+              const totalSets = completedSets.length;
               return (
                 <div key={j} className="flex justify-between items-center bg-black/20 p-2 rounded-xl border border-white/5 hover:border-white/10 transition">
                   <span className="text-sm font-bold uppercase tracking-tight text-white">{ex.name.split(' (')[0]}</span>
@@ -718,7 +1008,7 @@ function HistoryTab({ workouts }: { workouts: WorkoutSession[] }) {
 }
 
 // --- Body Tab ---
-function BodyTab({ bodyStats, onSave }: any) {
+function BodyTab({ bodyStats, onSave, showToast }: any) {
   const [showForm, setShowForm] = useState(false);
   const [formData, setFormData] = useState({ weight: '', bodyFat: '', muscleMass: '' });
 
@@ -732,6 +1022,7 @@ function BodyTab({ bodyStats, onSave }: any) {
     });
     setShowForm(false);
     setFormData({ weight: '', bodyFat: '', muscleMass: '' });
+    showToast('體態數據已更新！');
   };
 
   const chartData = bodyStats.map((s:any) => ({
@@ -740,39 +1031,51 @@ function BodyTab({ bodyStats, onSave }: any) {
   }));
 
   return (
-    <div className="space-y-6 animate-in fade-in mt-4">
+    <div className="space-y-6 mt-4">
       <div className="flex justify-between items-center mb-6">
         <div>
           <h2 className="text-4xl font-black tracking-tighter uppercase italic">體態紀錄</h2>
           <p className="text-[10px] uppercase tracking-widest font-bold text-lime-400">目前目標：身體重組成</p>
         </div>
-        <button 
+        <motion.button 
+          whileTap={{ scale: 0.9 }}
           onClick={() => setShowForm(!showForm)}
           className="p-3 bg-lime-400 text-black rounded-xl hover:bg-lime-300 transition shadow-[0_0_15px_rgba(163,230,53,0.3)]"
         >
           <Plus size={24} strokeWidth={3} />
-        </button>
+        </motion.button>
       </div>
 
-      {showForm && (
-        <form onSubmit={handleSubmit} className={`p-6 rounded-3xl ${THEME.card} border ${THEME.border} mb-6 animate-in slide-in-from-top-2`}>
-          <div className="grid grid-cols-2 gap-4 mb-6">
-            <div>
-              <label className="text-[10px] uppercase tracking-widest font-bold text-neutral-500 block mb-2">體重 (kg)</label>
-              <input required type="number" step="0.1" value={formData.weight} onChange={e => setFormData({...formData, weight: e.target.value})} className={`w-full bg-black/40 backdrop-blur-md border ${THEME.border} rounded-xl p-3 text-lg font-black text-white focus:outline-none focus:border-lime-400 transition`} />
+      <AnimatePresence mode="wait">
+        {showForm && (
+          <motion.form 
+            initial={{ opacity: 0, height: 0, overflow: 'hidden' }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.3, ease: 'easeOut' }}
+            onSubmit={handleSubmit} 
+            className={`rounded-3xl ${THEME.card} border ${THEME.border} mb-6 block`}
+          >
+            <div className="p-6">
+              <div className="grid grid-cols-2 gap-4 mb-6">
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-bold text-neutral-500 block mb-2">體重 (kg)</label>
+                  <input required type="number" step="0.1" value={formData.weight} onChange={e => setFormData({...formData, weight: e.target.value})} className={`w-full bg-black/40 backdrop-blur-md border ${THEME.border} rounded-xl p-3 text-lg font-black text-white focus:outline-none focus:border-lime-400 transition`} />
+                </div>
+                <div>
+                  <label className="text-[10px] uppercase tracking-widest font-bold text-neutral-500 block mb-2">體脂率 (%)</label>
+                  <input required type="number" step="0.1" value={formData.bodyFat} onChange={e => setFormData({...formData, bodyFat: e.target.value})} className={`w-full bg-black/40 backdrop-blur-md border ${THEME.border} rounded-xl p-3 text-lg font-black text-white focus:outline-none focus:border-lime-400 transition`} />
+                </div>
+                <div className="col-span-2">
+                  <label className="text-[10px] uppercase tracking-widest font-bold text-neutral-500 block mb-2">骨骼肌重 (kg)</label>
+                  <input required type="number" step="0.1" value={formData.muscleMass} onChange={e => setFormData({...formData, muscleMass: e.target.value})} className={`w-full bg-black/40 backdrop-blur-md border ${THEME.border} rounded-xl p-3 text-lg font-black text-white focus:outline-none focus:border-lime-400 transition`} />
+                </div>
+              </div>
+              <motion.button whileTap={{ scale: 0.95 }} type="submit" className="w-full py-4 bg-lime-400 text-black font-black uppercase tracking-widest text-xs rounded-xl shadow-[0_0_20px_rgba(163,230,53,0.2)]">儲存數據</motion.button>
             </div>
-            <div>
-              <label className="text-[10px] uppercase tracking-widest font-bold text-neutral-500 block mb-2">體脂率 (%)</label>
-              <input required type="number" step="0.1" value={formData.bodyFat} onChange={e => setFormData({...formData, bodyFat: e.target.value})} className={`w-full bg-black/40 backdrop-blur-md border ${THEME.border} rounded-xl p-3 text-lg font-black text-white focus:outline-none focus:border-lime-400 transition`} />
-            </div>
-            <div className="col-span-2">
-              <label className="text-[10px] uppercase tracking-widest font-bold text-neutral-500 block mb-2">骨骼肌重 (kg)</label>
-              <input required type="number" step="0.1" value={formData.muscleMass} onChange={e => setFormData({...formData, muscleMass: e.target.value})} className={`w-full bg-black/40 backdrop-blur-md border ${THEME.border} rounded-xl p-3 text-lg font-black text-white focus:outline-none focus:border-lime-400 transition`} />
-            </div>
-          </div>
-          <button type="submit" className="w-full py-4 bg-lime-400 text-black font-black uppercase tracking-widest text-xs rounded-xl shadow-[0_0_20px_rgba(163,230,53,0.2)]">儲存數據</button>
-        </form>
-      )}
+          </motion.form>
+        )}
+      </AnimatePresence>
 
       {bodyStats.length > 0 ? (
         <>
@@ -837,7 +1140,7 @@ function ReferenceTab() {
   ];
 
   return (
-    <div className="space-y-4 animate-in fade-in pb-10 mt-4">
+    <div className="space-y-4 pb-10 mt-4">
       <h2 className="text-4xl font-black tracking-tighter uppercase italic mb-6">動作圖解與要訣</h2>
       {guide.map((item, i) => (
         <div key={i} className={`p-6 rounded-3xl ${THEME.card} border ${THEME.border}`}>
